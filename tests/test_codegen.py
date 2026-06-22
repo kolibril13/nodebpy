@@ -88,6 +88,23 @@ def _assert_roundtrip(tree):
 # ---------------------------------------------------------------------------
 
 
+def test_with_probe_tree_returns_default_on_failure():
+    """A probe whose body raises (here: an invalid tree idname) yields the
+    supplied default instead of propagating, and a successful probe returns its
+    result."""
+    from nodebpy.export.codegen import _with_probe_tree
+
+    sentinel = object()
+    assert (
+        _with_probe_tree("NotARealTreeType", lambda tree: "unused", sentinel)
+        is sentinel
+    )
+    assert (
+        _with_probe_tree("GeometryNodeTree", lambda tree: tree.bl_idname, None)
+        == "GeometryNodeTree"
+    )
+
+
 def test_single_node():
     """Minimal: one node, no links. Validates registry lookup and var naming."""
     with TreeBuilder("SingleNode") as tree:
@@ -320,6 +337,20 @@ def test_format_with_ruff_tidies_output():
     ns: dict = {}
     exec(formatted, ns)  # noqa: S102 — still runnable
     assert ns["tree"] is not None
+
+
+def test_nodebpy_pkg_rewrites_import_anchor():
+    """nodebpy_pkg rewrites every nodebpy import anchor so vendored copies are
+    reachable with a relative path; the same anchor is used for both the
+    top-level and ``.builder`` imports."""
+    with TreeBuilder("Vendored") as tree:
+        geo = tree.inputs.geometry("Geometry")
+        g.SetPosition(geometry=geo) >> tree.outputs.geometry("Geometry")
+
+    code = to_python(tree, top_level="class", nodebpy_pkg="..vendor.nodebpy")
+    assert "from ..vendor.nodebpy import" in code
+    assert "from ..vendor.nodebpy.builder import" in code
+    assert "from nodebpy" not in code
 
 
 def test_top_level_class_emits_class_not_with_block():
@@ -613,12 +644,12 @@ def test_math_no_lift_when_unlinked():
 
 
 def test_math_non_liftable_stays_as_call():
-    """Non-liftable operation (SINE) stays a call — via the factory shortcut."""
-    with TreeBuilder("MathSine") as tree:
+    """Non-liftable operation (INVERSE_SQUARE_ROOT) stays a call — via the factory shortcut."""
+    with TreeBuilder("MathInverseSquareRoot") as tree:
         val = tree.inputs.float("Value", 1.0)
-        g.Math(val, operation="SINE") >> tree.outputs.float("Result")
+        g.Math.inverse_square_root(val) >> tree.outputs.float("Result")
     code = to_python(tree)
-    assert "g.Math.sine(value)" in code
+    assert "g.Math.inverse_square_root(value)" in code
 
 
 def test_math_fanout_assigns_variable():
@@ -2035,6 +2066,94 @@ def test_grid_info_accessors_dissolve():
     assert "GridInfo" not in code
 
 
+def _named_grid(tree, dtype="density"):
+    vol = tree.inputs.geometry("Volume")
+    return g.GetNamedGrid(vol, dtype).o.grid
+
+
+def test_grid_numeric_methods_lift():
+    """Mean / median lift to grid socket methods; data_type re-derived."""
+    with TreeBuilder("GridNumeric") as tree:
+        grid = _named_grid(tree)
+        grid.mean(width=2, iterations=3) >> tree.outputs.float(
+            "M", structure_type="GRID"
+        )
+        grid.median() >> tree.outputs.float("Md", structure_type="GRID")
+    code = _assert_roundtrip(tree)
+    assert ".mean(" in code
+    assert ".median()" in code
+    assert "g.GridMean(" not in code
+
+
+def test_grid_float_operator_methods_lift():
+    """Float-grid operators (gradient / sdf_* / to_mesh) lift to socket methods."""
+    with TreeBuilder("GridFloatOps") as tree:
+        grid = _named_grid(tree)
+        grid.gradient() >> tree.outputs.vector("G", structure_type="GRID")
+        grid.laplacian() >> tree.outputs.float("L", structure_type="GRID")
+        grid.sdf_offset(distance=0.5) >> tree.outputs.float("O", structure_type="GRID")
+        grid.sdf_mean(width=2) >> tree.outputs.float("SM", structure_type="GRID")
+        grid.to_mesh(threshold=0.2) >> tree.outputs.geometry("Mesh")
+    code = _assert_roundtrip(tree)
+    assert ".gradient()" in code
+    assert ".laplacian()" in code
+    assert ".sdf_offset(" in code
+    assert ".to_mesh(" in code
+
+
+def test_grid_vector_operator_methods_lift():
+    """Vector-grid operators (curl / divergence) lift to socket methods."""
+    with TreeBuilder("GridVecOps") as tree:
+        grid = g.GetNamedGrid.vector(tree.inputs.geometry("Volume"), "vel").o.grid
+        grid.curl() >> tree.outputs.vector("C", structure_type="GRID")
+        grid.divergence() >> tree.outputs.float("D", structure_type="GRID")
+    code = _assert_roundtrip(tree)
+    assert ".curl()" in code
+    assert ".divergence()" in code
+
+
+def test_grid_common_methods_lift():
+    """Methods shared by every grid type (sample / clip / prune / …) lift."""
+    with TreeBuilder("GridCommon") as tree:
+        grid = _named_grid(tree)
+        grid.sample(interpolation="Nearest Neighbor") >> tree.outputs.float("S")
+        grid.sample_index(x=1, y=2, z=3) >> tree.outputs.float("SI")
+        grid.clip(max_x=10) >> tree.outputs.float("Cl", structure_type="GRID")
+        grid.dilate_erode(steps=2) >> tree.outputs.float("DE", structure_type="GRID")
+        grid.prune(threshold=0.05, mode="SDF") >> tree.outputs.float(
+            "P", structure_type="GRID"
+        )
+        grid.voxelize() >> tree.outputs.float("V", structure_type="GRID")
+    code = _assert_roundtrip(tree)
+    for snippet in (
+        ".sample(",
+        ".sample_index(",
+        ".clip(",
+        ".dilate_erode(",
+        ".prune(",
+        ".voxelize()",
+    ):
+        assert snippet in code, snippet
+
+
+def test_grid_method_defers_when_rebuild_loses_structure():
+    """A grid whose GRID structure is only *propagated* (an EvaluateClosure
+    output) is lost on rebuild — the rebuilt output item carries no GRID
+    structure — so codegen must fall back to the constructor rather than emit a
+    method the rebuilt (non-grid) wrapper would lack. The closure output's
+    structure is set directly on the node, mirroring an authored-in-Blender
+    grid that nodebpy's closure API does not yet round-trip."""
+    with TreeBuilder("GridDeferred") as tree:
+        closure = tree.inputs.closure("Make Grid")
+        evaluated = g.EvaluateClosure(closure, output_items={"Grid": "FLOAT"})
+        evaluated.node.output_items[0].structure_type = "GRID"
+        g.GridToMesh(grid=evaluated.o.grid) >> tree.outputs.geometry("Mesh")
+    assert evaluated.o.grid.socket.inferred_structure_type == "GRID"
+    code = _assert_roundtrip(tree)
+    assert "g.GridToMesh(" in code
+    assert ".to_mesh(" not in code
+
+
 # ---------------------------------------------------------------------------
 # Parametrised round-trip over every tree built in test_usecases.py
 # ---------------------------------------------------------------------------
@@ -2234,6 +2353,154 @@ def test_roundtrip_bundled_asset(path, name):
     if builder is None:
         pytest.skip(f"unsupported tree type {group.bl_idname}")
     _assert_roundtrip(builder(group))
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for round-trip bugs first surfaced by MolecularNodes assets,
+# reproduced here with hand-built trees so they run without the MN library.
+# ---------------------------------------------------------------------------
+
+
+def test_keyword_named_output_uses_suffixed_attribute():
+    """An output socket whose name would normalize to a Python keyword (``From``
+    → ``from``) is read via the suffixed attribute ``.o.from_`` — ``normalize_name``
+    appends the underscore so the accessor resolves it and ``.o.from`` (a
+    SyntaxError) is never emitted. (MN asset: "Sample Mixed Color".)"""
+    from nodebpy.builder import CustomGeometryGroup
+
+    class _KeywordOut(CustomGeometryGroup):
+        _name = "KeywordOutGrp"
+
+        def _build_group(self, tree):
+            v = tree.inputs.float("Value")
+            v >> tree.outputs.float("Value")
+            v >> tree.outputs.integer("From")
+
+    with TreeBuilder("KeywordOutTree") as tree:
+        v = tree.inputs.float("Value")
+        grp = _KeywordOut(**{"Value": v})
+        grp.o["From"] >> tree.outputs.integer("Result")
+
+    code = _assert_roundtrip(tree)
+    assert ".o.from_" in code
+    assert ".o.from " not in code
+
+
+def test_links_into_inactive_sockets_are_dropped():
+    """Links Blender keeps but ignores at evaluation (into sockets hidden by a
+    ``data_type`` switch — here a Mix node set to RGBA still carries float A/B
+    links) are not effective: they're excluded from emission and structural
+    comparison so the tree round-trips. (MN asset: "Index Mix Color".)"""
+    from nodebpy.export.codegen import _effective_links
+
+    with TreeBuilder("InactiveMix", ignore_visibility=True) as tree:
+        col = tree.inputs.color("Color")
+        fac = tree.inputs.float("Fac")
+        mix = g.Mix(
+            data_type="RGBA",
+            factor_float=fac,
+            a_color=col,
+            b_color=col,
+            a_float=fac,
+            b_float=fac,
+        )
+        mix.o.result_color >> tree.outputs.color("Result")
+
+    mix_links = [
+        link for link in tree.tree.links if link.to_node.bl_idname == "ShaderNodeMix"
+    ]
+    # The raw tree carries the inactive float A/B links...
+    assert any(not link.to_socket.enabled for link in mix_links)
+    # ...but they are not "effective" and so are filtered out.
+    effective = [
+        link
+        for link in _effective_links(tree.tree)
+        if link.to_node.bl_idname == "ShaderNodeMix"
+    ]
+    assert effective and all(link.to_socket.enabled for link in effective)
+
+    code = _assert_roundtrip(tree)
+    assert "a_float" not in code and "b_float" not in code
+
+
+def test_axes_to_rotation_socket_property_collision():
+    """A constructor param that names an input socket (AxesToRotation's
+    ``primary_axis`` Vector socket) must not be mistaken for the same-named bpy
+    enum property; the enum rides on the renamed ``primary`` param instead.
+    (MN asset: "Plexus".)"""
+    from nodebpy.export.codegen import _non_default_props
+
+    with TreeBuilder("AxesRot") as tree:
+        vec = tree.inputs.vector("V")
+        node = g.AxesToRotation(primary_axis=vec)
+        node.o.rotation >> tree.outputs.rotation("R")
+        # Defaults: nothing emitted, and never the socket-named ``*_axis``.
+        assert _non_default_props(node.node, g.AxesToRotation) == {}
+
+    code = _assert_roundtrip(tree)
+    assert "secondary_axis=" not in code
+    assert "g.AxesToRotation(primary_axis=v)" in code
+
+    # A non-default enum is applied by the constructor (the renamed ``primary``
+    # param writes the bpy ``primary_axis`` property), emitted under that param,
+    # and round-trips back onto the rebuilt node.
+    with TreeBuilder("AxesRotProp") as tree:
+        vec = tree.inputs.vector("V")
+        node = g.AxesToRotation(primary_axis=vec, primary="X", secondary="Y")
+        # the constructor must actually write the enum to the node
+        assert node.node.primary_axis == "X"
+        assert node.node.secondary_axis == "Y"
+        node.o.rotation >> tree.outputs.rotation("R")
+        assert _non_default_props(node.node, g.AxesToRotation) == {
+            "primary": "X",
+            "secondary": "Y",
+        }
+
+    code = _assert_roundtrip(tree)
+    assert 'g.AxesToRotation(primary_axis=v, primary="X", secondary="Y")' in code
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    rebuilt_axes = next(
+        n for n in ns["tree"].tree.nodes if n.bl_idname == "FunctionNodeAxesToRotation"
+    )
+    assert rebuilt_axes.primary_axis == "X"
+    assert rebuilt_axes.secondary_axis == "Y"
+
+
+def test_property_rna_name_unreadable_getter_returns_none():
+    """A proxy ``@property`` whose getter source can't be retrieved (here
+    compiled from a string, so it has no source file) falls through to ``None``
+    instead of raising — covers the defensive ``getsource`` guard."""
+    from nodebpy.export.codegen import _property_rna_name
+
+    ns: dict = {}
+    exec(  # noqa: S102 — getter has no source file, so getsource() raises OSError
+        "class C:\n"
+        "    @property\n"
+        "    def primary(self):\n"
+        "        return self.node.primary_axis\n",
+        ns,
+    )
+    # ``primary`` isn't itself a bpy prop, so resolution falls to the getter,
+    # whose source is unavailable → the except branch returns None.
+    assert _property_rna_name(ns["C"], "primary", {"primary_axis"}) is None
+
+
+def test_duplicate_separators_on_one_source_stay_explicit():
+    """Several separator nodes sharing a source socket must not all dissolve to
+    the component accessor — ``_find_or_create_linked`` would collapse them into
+    one node. They stay as explicit constructor calls so the count round-trips.
+    (MN asset: "Color Mix Intermediate".)"""
+    with TreeBuilder("DupSeparate") as tree:
+        col = tree.inputs.color("Color")
+        s1 = g.SeparateColor(color=col)
+        s2 = g.SeparateColor(color=col)
+        g.CombineColor(red=s1.o.red, green=s2.o.green) >> tree.outputs.color("Result")
+
+    code = _assert_roundtrip(tree)
+    assert code.count("g.SeparateColor(color=color)") == 2
+    # not dissolved to the accessor sugar
+    assert "color.r" not in code and "color.g" not in code
 
 
 MN_FILE_PATH = (

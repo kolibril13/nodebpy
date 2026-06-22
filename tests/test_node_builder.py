@@ -27,7 +27,7 @@ from nodebpy import geometry as g
 from nodebpy import shader as s
 from nodebpy.builder import BaseNode as BaseNode
 from nodebpy.builder import ColorSocket as ColorSocketLinker
-from nodebpy.builder import SocketAccessor, SocketError
+from nodebpy.builder import NodeGroupBuilder, SocketAccessor, SocketError
 
 
 class TestTreeBuilder:
@@ -150,6 +150,28 @@ class TestOperatorChaining:
 
         # Check that links were created
         assert len(tree.tree.links) >= 3
+
+    @pytest.mark.parametrize("trans", [True, False])
+    def test_optional_none_node_skipped(self, trans):
+        """A ``None`` in the chain is a no-op passthrough."""
+        tree = TreeBuilder("OptionalNoneChain")
+        i_geo = tree.inputs.geometry()
+        o_geo = tree.outputs.geometry()
+
+        with tree:
+            _ = (
+                i_geo
+                >> g.SetPosition()
+                >> (g.TransformGeometry(translation=(0, 0, 1)) if trans else None)
+                >> o_geo
+            )
+
+        node_types = [n.bl_idname for n in tree.tree.nodes]
+        assert ("GeometryNodeTransform" in node_types) == trans
+        # When skipped, SetPosition links straight to the output, so the
+        # optional node neither adds itself nor breaks the chain.
+        expected_links = 3 if trans else 2
+        assert len(tree.tree.links) == expected_links
 
 
 class TestExamples:
@@ -530,13 +552,19 @@ def test_nested_trees():
 
 
 def _collect_node_classes(module):
-    """Collect BaseNode subclass names from a module."""
+    """Collect built-in BaseNode subclass names from a module.
+
+    Node *groups* (NodeGroupBuilder subclasses, including the generated asset
+    classes) are excluded — they append/build a tree rather than being plain
+    nodes, so they don't fit this generic instantiate-every-node sweep and are
+    covered by their own tests (e.g. test_assets.py)."""
     return [
         name
         for name in dir(module)
         if re.match(r"^[A-Z][a-zA-Z0-9]+$", name)
         and inspect.isclass(cls := getattr(module, name))
         and issubclass(cls, BaseNode)
+        and not issubclass(cls, NodeGroupBuilder)
     ]
 
 

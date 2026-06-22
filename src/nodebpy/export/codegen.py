@@ -27,12 +27,14 @@ import keyword
 import re
 import textwrap
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, TypeVar
 
 from bpy.types import FunctionNodeCompare, NodeTree
 
 if TYPE_CHECKING:
     from ..builder.tree import TreeBuilder
+
+_T = TypeVar("_T")
 
 
 class CodegenError(Exception):
@@ -497,6 +499,23 @@ def _find_cls(bl_idname: str) -> tuple[str, type] | None:
 # Blender socket defaults — probed on a scratch tree, never the user's tree
 # ---------------------------------------------------------------------------
 
+
+def _with_probe_tree(tree_idname: str, fn: Callable[[Any], _T], default: _T) -> _T:
+    """Run ``fn`` against a throwaway node tree of ``tree_idname`` and return its
+    result, removing the tree afterward. Returns ``default`` if Blender is
+    unavailable or anything goes wrong. The probe tree is never the user's."""
+    try:
+        import bpy
+
+        probe_tree = bpy.data.node_groups.new("__nodebpy_codegen_probe__", tree_idname)  # ty: ignore[invalid-argument-type]
+        try:
+            return fn(probe_tree)
+        finally:
+            bpy.data.node_groups.remove(probe_tree)
+    except Exception:
+        return default
+
+
 _BLENDER_SOCKET_DEFAULTS: dict[tuple[str, str], dict[str, object]] = {}
 
 
@@ -505,27 +524,56 @@ def _get_blender_socket_defaults(tree_idname: str, bl_idname: str) -> dict[str, 
     key = (tree_idname, bl_idname)
     if key in _BLENDER_SOCKET_DEFAULTS:
         return _BLENDER_SOCKET_DEFAULTS[key]
-    defaults: dict[str, object] = {}
-    try:
-        import bpy
 
-        probe_tree = bpy.data.node_groups.new("__nodebpy_codegen_probe__", tree_idname)
-        try:
-            node = probe_tree.nodes.new(bl_idname)
-            for s in node.inputs:
-                if not hasattr(s, "default_value"):
-                    continue
-                val = s.default_value
-                try:
-                    defaults[s.identifier] = tuple(val)
-                except TypeError:
-                    defaults[s.identifier] = val
-        finally:
-            bpy.data.node_groups.remove(probe_tree)
-    except Exception:
-        pass
+    def probe(probe_tree) -> dict[str, object]:
+        defaults: dict[str, object] = {}
+        node = probe_tree.nodes.new(bl_idname)
+        for s in node.inputs:
+            if not hasattr(s, "default_value"):
+                continue
+            val = s.default_value
+            try:
+                defaults[s.identifier] = tuple(val)
+            except TypeError:
+                defaults[s.identifier] = val
+        return defaults
+
+    defaults = _with_probe_tree(tree_idname, probe, {})
     _BLENDER_SOCKET_DEFAULTS[key] = defaults
     return defaults
+
+
+_NODE_OUTPUT_STRUCTURE: dict[tuple[str, str, str], str | None] = {}
+
+
+def _fresh_output_structure(
+    tree_idname: str, bl_idname: str, output_id: str
+) -> str | None:
+    """``inferred_structure_type`` of a freshly created node's output socket.
+
+    Returns ``None`` when a fresh node has no socket with that identifier.
+    A grid socket method lifts to a call on the grid *wrapper*, which the
+    rebuilt receiver only exposes when its source node reproduces the GRID
+    structure on its own (GetNamedGrid, the grid operators, …). Sources whose
+    structure is *propagated* or *dynamic* — EvaluateClosure, switches, group
+    inputs — report GRID in the authored tree but lose it on a fresh rebuild,
+    so the method would be missing; codegen falls back to the constructor for
+    them. Probed on a scratch tree, never the user's.
+    """
+    key = (tree_idname, bl_idname, output_id)
+    if key in _NODE_OUTPUT_STRUCTURE:
+        return _NODE_OUTPUT_STRUCTURE[key]
+
+    def probe(probe_tree) -> str | None:
+        node = probe_tree.nodes.new(bl_idname)
+        for s in node.outputs:
+            if s.identifier == output_id:
+                return getattr(s, "inferred_structure_type", None)
+        return None
+
+    result = _with_probe_tree(tree_idname, probe, None)
+    _NODE_OUTPUT_STRUCTURE[key] = result
+    return result
 
 
 _IFACE_DEFAULTS: dict[tuple[str, str], dict[str, object]] = {}
@@ -536,32 +584,28 @@ def _get_interface_defaults(tree_idname: str, socket_type: str) -> dict[str, obj
     key = (tree_idname, socket_type)
     if key in _IFACE_DEFAULTS:
         return _IFACE_DEFAULTS[key]
-    defaults: dict[str, object] = {}
-    try:
-        import bpy
 
-        probe_tree = bpy.data.node_groups.new("__nodebpy_codegen_probe__", tree_idname)
-        try:
-            socket = probe_tree.interface.new_socket(
-                "probe", in_out="INPUT", socket_type=socket_type
-            )
-            for prop in socket.bl_rna.properties:
-                if prop.is_readonly:
-                    continue
+    def probe(probe_tree) -> dict[str, object]:
+        defaults: dict[str, object] = {}
+        socket = probe_tree.interface.new_socket(
+            "probe", in_out="INPUT", socket_type=socket_type
+        )
+        for prop in socket.bl_rna.properties:
+            if prop.is_readonly:
+                continue
+            try:
+                value = getattr(socket, prop.identifier)
+            except Exception:
+                continue
+            if not isinstance(value, str):
                 try:
-                    value = getattr(socket, prop.identifier)
-                except Exception:
-                    continue
-                if not isinstance(value, str):
-                    try:
-                        value = tuple(value)
-                    except TypeError:
-                        pass
-                defaults[prop.identifier] = value
-        finally:
-            bpy.data.node_groups.remove(probe_tree)
-    except Exception:
-        pass
+                    value = tuple(value)
+                except TypeError:
+                    pass
+            defaults[prop.identifier] = value
+        return defaults
+
+    defaults = _with_probe_tree(tree_idname, probe, {})
     _IFACE_DEFAULTS[key] = defaults
     return defaults
 
@@ -651,6 +695,9 @@ def _canonical_links(node_tree, links: list[_Link]) -> list[_Link]:
 def _effective_links(node_tree, keep_reroutes: bool = False) -> list[_Link]:
     """All links with reroutes collapsed; reroute-internal segments dropped.
 
+    Links Blender keeps but ignores during evaluation (into sockets hidden by a
+    mode/``data_type`` switch) are excluded — see :func:`_is_ignored_link`.
+
     With ``keep_reroutes`` the reroute chain is left intact — every raw link is
     kept (reroutes become ordinary pass-through nodes). Returned in canonical
     (structural) order — see :func:`_canonical_links`.
@@ -658,6 +705,8 @@ def _effective_links(node_tree, keep_reroutes: bool = False) -> list[_Link]:
     links: list[_Link] = []
     for link in node_tree.links:
         if not keep_reroutes and link.to_node.bl_idname == "NodeReroute":
+            continue
+        if _is_ignored_link(link):
             continue
         if keep_reroutes:
             from_node, from_socket = link.from_node, link.from_socket
@@ -677,6 +726,34 @@ def _effective_links(node_tree, keep_reroutes: bool = False) -> list[_Link]:
             )
         )
     return _canonical_links(node_tree, links)
+
+
+def _is_ignored_link(link) -> bool:
+    """True when Blender keeps this link but ignores it during evaluation.
+
+    Switching a node's mode/``data_type`` (e.g. a Mix node wired for every type,
+    then set to ``RGBA``) hides the now-irrelevant sockets but leaves their links
+    in place. Such links don't participate in evaluation, and ``TreeBuilder.link``
+    refuses to recreate them (its visibility/type guards reject the inactive,
+    often type-mismatched socket), so they aren't *effective* and must be dropped
+    consistently from emission, ordering, and structural comparison. Mirrors the
+    visibility guard in :meth:`TreeBuilder.link`.
+    """
+    from ..builder._utils import _allow_innactive_sockets
+
+    for socket, node in (
+        (link.from_socket, link.from_node),
+        (link.to_socket, link.to_node),
+    ):
+        if node.bl_idname == "NodeReroute":
+            continue  # collapsed away on rebuild — its sockets never link
+        if (
+            getattr(socket, "is_inactive", False)
+            and not _allow_innactive_sockets(node)
+            and getattr(node, "data_type", None) != socket.type
+        ):
+            return True
+    return False
 
 
 def _ordering_edges(node_tree, keep_reroutes: bool = False):
@@ -1177,10 +1254,12 @@ def _output_expr(
         key = _normalize(from_socket.identifier)
     else:
         key = _normalize(from_socket.name)
-    # A name that isn't a valid Python identifier (``"Physics (Experimental)"``
-    # → ``physics_(experimental)``) can't be an attribute — read it by the raw
-    # socket name via subscript, which the accessor resolves by name.
-    if not key.isidentifier():
+    # ``normalize_name`` already folds non-identifier characters to underscores
+    # and suffixes keywords (``"From"`` → ``from_``), so ``key`` is normally a
+    # safe attribute. This guards the residual cases (e.g. a bare ``"_"``) by
+    # falling back to the raw socket name via subscript, which the accessor
+    # resolves by name.
+    if not key.isidentifier() or keyword.iskeyword(key):
         return Subscript(Attr(val.expr, "o"), Lit(from_socket.name))
     return Attr(val.expr, f"o.{key}")
 
@@ -1212,6 +1291,40 @@ def _base_node_props() -> set[str]:
     return _BASE_NODE_PROPS
 
 
+def _property_rna_name(cls: type, name: str, rna_props) -> str | None:
+    """The bpy property a constructor property-param controls, or ``None``.
+
+    Usually the param name *is* the property identifier (``data_type``). Some
+    classes expose a property under a different name to avoid colliding with a
+    same-named input socket — AxesToRotation's ``primary`` proxies the
+    ``primary_axis`` enum because ``primary_axis`` is already the Vector socket.
+    For those, follow the ``@property`` getter's ``return self.node.<attr>``.
+    """
+    if rna_props is not None and name in rna_props:
+        return name
+    attr = inspect.getattr_static(cls, name, None)
+    if not isinstance(attr, property) or attr.fget is None:
+        return None
+    try:
+        body = ast.parse(textwrap.dedent(inspect.getsource(attr.fget)))
+    except (OSError, TypeError, SyntaxError):
+        return None
+    for sub in ast.walk(body):
+        # return self.node.<attr>
+        if (
+            isinstance(sub, ast.Return)
+            and isinstance(sub.value, ast.Attribute)
+            and isinstance(sub.value.value, ast.Attribute)
+            and sub.value.value.attr == "node"
+            and isinstance(sub.value.value.value, ast.Name)
+            and sub.value.value.value.id == "self"
+        ):
+            rna = sub.value.attr
+            if rna_props is not None and rna in rna_props:
+                return rna
+    return None
+
+
 def _non_default_props(node, cls: type) -> dict[str, Any]:
     """Constructor property values that differ from their defaults.
 
@@ -1234,18 +1347,26 @@ def _non_default_props(node, cls: type) -> dict[str, Any]:
             inspect.Parameter.KEYWORD_ONLY,
         ):
             continue
-        # A constructor param represents a node setting only if it names an
-        # actual bpy property. This excludes nodebpy-only convenience params
-        # such as FloatCurve's ``items`` (curve points), whose ``getattr`` would
-        # otherwise resolve to the unrelated ``bpy_struct.items`` dict method.
-        if rna_props is None or name not in rna_props:
-            continue
-        if name in _base_node_props():
-            continue
         if param.default is inspect.Parameter.empty:
             continue
+        # A param that names an input socket is a socket argument, not a
+        # property — even when its name happens to match a bpy property.
+        # AxesToRotation's ``primary_axis`` is the Vector socket; the enum of
+        # the same bpy name rides on the separate ``primary`` param instead.
+        if _input_socket_by_kwarg(node, name) is not None:
+            continue
+        # A constructor param represents a node setting only if it (or the
+        # property it proxies) names an actual bpy property. This excludes
+        # nodebpy-only convenience params such as FloatCurve's ``items`` (curve
+        # points), whose ``getattr`` would otherwise resolve to the unrelated
+        # ``bpy_struct.items`` dict method.
+        rna_name = _property_rna_name(cls, name, rna_props)
+        if rna_name is None:
+            continue
+        if rna_name in _base_node_props():
+            continue
         try:
-            current = getattr(node, name)
+            current = getattr(node, rna_name)
         except AttributeError:
             continue
         if current != param.default:
@@ -1548,6 +1669,9 @@ class SocketMethodSpec:
     # be a LIST whose element type matches this prop (``socket_type`` /
     # ``data_type``), inverting _socket_dtype's VALUE↔FLOAT swap, so the rebuilt
     # method re-derives the same prop from the receiver socket.
+    receiver_structure: str | None = None  # required inferred_structure_type of
+    # the from-socket (grid methods live on the ``*SocketGrid`` wrappers only, so
+    # the receiver must be a GRID, not a plain field of the same socket type).
 
 
 @dataclass(frozen=True)
@@ -1693,7 +1817,7 @@ def _matrix_spec(method: str, output: str) -> SocketMethodSpec:
     )
 
 
-def _math_unary_spec(operation: str, method: str) -> SocketMethodSpec:
+def _math_unary_spec(operation: str, method: str, *args: str) -> SocketMethodSpec:
     """A unary ``ShaderNodeMath`` op rendered as a float socket method —
     ``value.sqrt()`` / ``value.sign()``. ``receiver_socket_type="VALUE"`` keeps
     the round-trip faithful: the method only re-derives a float Math node when
@@ -1702,13 +1826,14 @@ def _math_unary_spec(operation: str, method: str) -> SocketMethodSpec:
         receiver="Value",
         method=method,
         output="Value",
+        params=tuple((f"Value_{int(i + 1)}", arg) for i, arg in enumerate(args)),
         require=(("operation", operation),),
         consumed_props=("operation",),
         receiver_socket_type="VALUE",
     )
 
 
-def _int_math_unary_spec(operation: str, method: str) -> SocketMethodSpec:
+def _int_math_unary_spec(operation: str, method: str, *args: str) -> SocketMethodSpec:
     """A unary ``FunctionNodeIntegerMath`` op rendered as an integer socket
     method — ``value.sign()``. ``ABSOLUTE``/``NEGATE`` stay as the ``abs(x)`` /
     ``-x`` lifts and so are deliberately absent here."""
@@ -1716,6 +1841,7 @@ def _int_math_unary_spec(operation: str, method: str) -> SocketMethodSpec:
         receiver="Value",
         method=method,
         output="Value",
+        params=tuple((f"Value_{int(i + 1)}", arg) for i, arg in enumerate(args)),
         require=(("operation", operation),),
         consumed_props=("operation",),
         receiver_socket_type="INT",
@@ -1757,6 +1883,32 @@ def _mix_spec(data_type: str, attr: str, suffix: str) -> SocketMethodSpec:
         consumed_props=("data_type",),
         receiver_socket_type="VALUE",
         always_args=2,
+    )
+
+
+def _grid_spec(
+    method: str,
+    output: str,
+    *params: tuple[str, str],
+    receiver_socket_type: str = "{data_type}",
+    data_type: bool = True,
+    always_args: int = 0,
+) -> SocketMethodSpec:
+    """A grid socket method — ``grid.mean()`` / ``grid.gradient()`` /
+    ``grid.sample(pos)``. The receiver must be a GRID-structured socket (the
+    methods live only on the ``*SocketGrid`` wrappers). Data-type-carrying grid
+    nodes re-derive ``data_type`` from the receiver's element type, so it is
+    consumed and gated by ``receiver_socket_type="{data_type}"`` rather than
+    emitted; the scalar/vector-only nodes pin a fixed ``VALUE`` / ``VECTOR``."""
+    return SocketMethodSpec(
+        receiver="Grid",
+        method=method,
+        output=output,
+        params=tuple(params),
+        consumed_props=("data_type",) if data_type else (),
+        receiver_socket_type=receiver_socket_type,
+        receiver_structure="GRID",
+        always_args=always_args,
     )
 
 
@@ -1856,16 +2008,46 @@ _SOCKET_METHODS: dict[str, list[SocketMethodSpec]] = {
         ),
     ],
     "ShaderNodeMath": [
-        _math_unary_spec("SQRT", "sqrt"),
-        _math_unary_spec("FLOOR", "floor"),
-        _math_unary_spec("CEIL", "ceil"),
-        _math_unary_spec("ROUND", "round"),
-        _math_unary_spec("RADIANS", "to_radians"),
-        _math_unary_spec("DEGREES", "to_degrees"),
-        _math_unary_spec("SIGN", "sign"),
+        _math_unary_spec(*args)
+        for args in [
+            ("SINE", "sin"),
+            ("COSINE", "cos"),
+            ("TANGENT", "tan"),
+            ("ARCSINE", "asin"),
+            ("ARCCOSINE", "acos"),
+            ("ARCTANGENT", "atan"),
+            ("HYPERBOLIC_SINE", "sinh"),
+            ("HYPERBOLIC_COSINE", "cosh"),
+            ("HYPERBOLIC_TANGENT", "tanh"),
+            ("EXPONENTIAL", "exp"),
+            ("TRUNC", "truncate"),
+            ("FRACT", "fraction"),
+            # ("ABSOLUTE", "abs"), # should isntead be handled by stdlib `abs(int)`
+            ("SQRT", "sqrt"),
+            ("FLOOR", "floor"),
+            ("CEIL", "ceil"),
+            ("ROUND", "round"),
+            ("RADIANS", "to_radians"),
+            ("DEGREES", "to_degrees"),
+            ("SIGN", "sign"),
+            ("MINIMUM", "min", "value_001"),
+            ("MAXIMUM", "max", "value_001"),
+            ("MULTIPLY_ADD", "mul_add", "multiplier", "addend"),
+            ("WRAP", "wrap", "min", "max"),
+            ("MODULO", "modulo", "divisor"),
+            ("PINGPONG", "ping_pong", "value"),
+            ("LOGARITHM", "log", "base"),
+            ("ARCTAN2", "atan2", "value"),
+        ]
     ],
     "FunctionNodeIntegerMath": [
-        _int_math_unary_spec("SIGN", "sign"),
+        _int_math_unary_spec(*args)
+        for args in (
+            ("SIGN", "sign"),
+            # ("ABSOLUTE", "abs"),
+            ("MULTIPLY_ADD", "mul_add", "multiplier", "addend"),
+            ("MODULO", "modulo", "divisor"),
+        )
     ],
     "GeometryNodeListLength": [
         _list_spec("list_length", "Length", type_prop="data_type"),
@@ -1964,6 +2146,140 @@ _SOCKET_METHODS: dict[str, list[SocketMethodSpec]] = {
         _mix_spec("VECTOR", "vector", "Vector"),
         _mix_spec("RGBA", "color", "Color"),
         _mix_spec("ROTATION", "rotation", "Rotation"),
+    ],
+    # Grid socket methods — numeric grids (Float / Integer / Vector) -------
+    "GeometryNodeGridMean": [
+        _grid_spec("mean", "Grid", ("Width", "width"), ("Iterations", "iterations")),
+    ],
+    "GeometryNodeGridMedian": [
+        _grid_spec("median", "Grid", ("Width", "width"), ("Iterations", "iterations")),
+    ],
+    # Float-grid operators -------------------------------------------------
+    "GeometryNodeGridGradient": [
+        _grid_spec(
+            "gradient", "Gradient", receiver_socket_type="VALUE", data_type=False
+        ),
+    ],
+    "GeometryNodeGridLaplacian": [
+        _grid_spec(
+            "laplacian", "Laplacian", receiver_socket_type="VALUE", data_type=False
+        ),
+    ],
+    "GeometryNodeSDFGridFillet": [
+        _grid_spec(
+            "sdf_fillet",
+            "Grid",
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridLaplacian": [
+        _grid_spec(
+            "sdf_laplacian",
+            "Grid",
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridMean": [
+        _grid_spec(
+            "sdf_mean",
+            "Grid",
+            ("Width", "width"),
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridMeanCurvature": [
+        _grid_spec(
+            "sdf_mean_curvature",
+            "Grid",
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridMedian": [
+        _grid_spec(
+            "sdf_median",
+            "Grid",
+            ("Width", "width"),
+            ("Iterations", "iterations"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeSDFGridOffset": [
+        _grid_spec(
+            "sdf_offset",
+            "Grid",
+            ("Distance", "distance"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    "GeometryNodeGridToMesh": [
+        _grid_spec(
+            "to_mesh",
+            "Mesh",
+            ("Threshold", "threshold"),
+            ("Adaptivity", "adaptivity"),
+            receiver_socket_type="VALUE",
+            data_type=False,
+        ),
+    ],
+    # Vector-grid operators ------------------------------------------------
+    "GeometryNodeGridCurl": [
+        _grid_spec("curl", "Curl", receiver_socket_type="VECTOR", data_type=False),
+    ],
+    "GeometryNodeGridDivergence": [
+        _grid_spec(
+            "divergence", "Divergence", receiver_socket_type="VECTOR", data_type=False
+        ),
+    ],
+    # Methods on every grid type ------------------------------------------
+    "GeometryNodeSampleGrid": [
+        _grid_spec(
+            "sample",
+            "Value",
+            ("Position", "position"),
+            ("Interpolation", "interpolation"),
+        ),
+    ],
+    "GeometryNodeSampleGridIndex": [
+        _grid_spec("sample_index", "Value", ("X", "x"), ("Y", "y"), ("Z", "z")),
+    ],
+    "GeometryNodeGridClip": [
+        _grid_spec(
+            "clip",
+            "Grid",
+            ("Min X", "min_x"),
+            ("Min Y", "min_y"),
+            ("Min Z", "min_z"),
+            ("Max X", "max_x"),
+            ("Max Y", "max_y"),
+            ("Max Z", "max_z"),
+        ),
+    ],
+    "GeometryNodeGridDilateAndErode": [
+        _grid_spec(
+            "dilate_erode",
+            "Grid",
+            ("Steps", "steps"),
+            ("Connectivity", "connectivity"),
+            ("Tiles", "tiles"),
+        ),
+    ],
+    "GeometryNodeGridPrune": [
+        _grid_spec(
+            "prune", "Grid", ("Threshold", "threshold"), ("Mode", "mode"), always_args=1
+        ),
+    ],
+    "GeometryNodeGridVoxelize": [
+        _grid_spec("voxelize", "Grid"),
     ],
 }
 
@@ -2064,6 +2380,25 @@ def _list_receiver_ok(node, link, type_prop: str) -> bool:
     return prop is not None and prop.replace("FLOAT", "VALUE") == link.from_socket.type
 
 
+def _receiver_reproduces_structure(ctx: EmitContext, link, structure: str) -> bool:
+    """Whether ``link``'s source carries ``structure`` (GRID) both in the
+    authored tree and on a fresh rebuild of the source node.
+
+    The authored socket must already report the structure, and a freshly
+    created node of the same type must reproduce it on the same output — see
+    :func:`_fresh_output_structure` for why the rebuild check is needed."""
+    if getattr(link.from_socket, "inferred_structure_type", None) != structure:
+        return False
+    return (
+        _fresh_output_structure(
+            ctx.node_tree.bl_idname,
+            link.from_node.bl_idname,
+            link.from_socket.identifier,
+        )
+        == structure
+    )
+
+
 def _match_socket_method(
     ctx: EmitContext, node
 ) -> tuple[SocketMethodSpec, str, str] | None:
@@ -2091,6 +2426,10 @@ def _match_socket_method(
         if (
             expected_type is not None
             and receiver_link.from_socket.type != expected_type
+        ):
+            continue
+        if spec.receiver_structure is not None and not _receiver_reproduces_structure(
+            ctx, receiver_link, spec.receiver_structure
         ):
             continue
         if spec.receiver_list_prop is not None and not _list_receiver_ok(
@@ -2204,6 +2543,21 @@ def _dissolve_val(ctx: EmitContext, node, spec: DissolveSpec) -> _Val | None:
     links = ctx.incoming.get(node.name, ())
     if len(links) != 1 or links[0].to_socket.identifier != spec.receiver:
         return None
+    # ``_find_or_create_linked`` reuses one separator per (source socket, node
+    # type), so dissolving several separators that share a source socket would
+    # collapse them into a single rebuilt node. When the source feeds more than
+    # one separator of this type, keep them all as explicit constructor calls so
+    # the node count round-trips.
+    source = links[0].from_socket
+    siblings = sum(
+        1
+        for out in ctx.outgoing.get(links[0].from_node.name, ())
+        if out.from_socket.identifier == source.identifier
+        and out.to_node.bl_idname == node.bl_idname
+        and out.to_socket.identifier == spec.receiver
+    )
+    if siblings > 1:
+        return None
     expected_type = spec.receiver_socket_type
     if expected_type == "{data_type}":
         expected_type = _DATA_TYPE_SOCKET.get(getattr(node, "data_type", ""))
@@ -2211,10 +2565,8 @@ def _dissolve_val(ctx: EmitContext, node, spec: DissolveSpec) -> _Val | None:
             return None
     if expected_type is not None and links[0].from_socket.type != expected_type:
         return None
-    if (
-        spec.receiver_structure is not None
-        and getattr(links[0].from_socket, "inferred_structure_type", None)
-        != spec.receiver_structure
+    if spec.receiver_structure is not None and not _receiver_reproduces_structure(
+        ctx, links[0], spec.receiver_structure
     ):
         return None
     found = _find_cls(node.bl_idname)
@@ -2810,6 +3162,7 @@ def to_python(
     keep_reroutes: bool = False,
     top_level: Literal["with", "class"] = "with",
     format: bool = True,
+    nodebpy_pkg: str = "nodebpy",
 ) -> str:
     """Generate Python code that recreates the given node tree using nodebpy.
 
@@ -2854,6 +3207,12 @@ def to_python(
             If True (default) and the optional ``ruff`` package is installed,
             the generated source is run through ``ruff format`` for tidier
             output. A no-op when ``ruff`` is unavailable.
+        nodebpy_pkg: str
+            Import anchor for nodebpy in the generated source. Defaults to the
+            absolute ``"nodebpy"``. When nodebpy is vendored inside another
+            package, pass the path that reaches it *relative to the generated
+            module's package* — e.g. ``"..vendor.nodebpy"`` — so the emitted
+            imports stay relative to the install/vendor location.
 
     Returns
     -------
@@ -2892,10 +3251,11 @@ def to_python(
     import_names = import_parts + (["TreeBuilder"] if top_level == "with" else [])
     lines: list[str] = []
     if import_names:
-        lines.append("from nodebpy import " + ", ".join(import_names))
+        lines.append(f"from {nodebpy_pkg} import " + ", ".join(import_names))
     if collector.bases_used:
         lines.append(
-            "from nodebpy.builder import " + ", ".join(sorted(collector.bases_used))
+            f"from {nodebpy_pkg}.builder import "
+            + ", ".join(sorted(collector.bases_used))
         )
     # Group classes are top-level defs: two blank lines around each (PEP 8).
     for class_def in collector.class_defs:

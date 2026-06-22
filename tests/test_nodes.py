@@ -1111,6 +1111,10 @@ def test_manual_field_factories():
         assert eod.domain == "EDGE"
         assert eod.data_type == "FLOAT4X4"
 
+        eod = g.EvaluateOnDomain.face.color()
+        assert eod.domain == "FACE"
+        assert eod.data_type == "FLOAT_COLOR"
+
         stat = g.AttributeStatistic.point.float()
         assert stat.domain == "POINT"
         assert stat.data_type == "FLOAT"
@@ -1210,6 +1214,8 @@ def test_grid():
 
 def test_bundle_item():
     with g.tree():
+        bundle = g.CombineBundle({"pos": g.Position().o.position, "val": 0.5})
+
         gbi = g.GetBundleItem.float()
         assert gbi.structure_type == "AUTO"
         gbi.structure_type = "LIST"
@@ -1230,6 +1236,18 @@ def test_bundle_item():
         assert switch.input_type == "BUNDLE"
         switch.input_type = "FLOAT"
         assert switch.input_type == "FLOAT"
+
+        assert not bundle.define_signature
+        bundle.define_signature = True
+        assert bundle.define_signature
+        assert isinstance(bundle.i["val"], FloatSocket)
+        sep = g.SeparateBundle()
+        assert not sep.define_signature
+        sep.define_signature = True
+        assert sep.define_signature
+
+        with pytest.raises(TypeError):
+            g.CombineBundle({"pos": float})
 
 
 def test_uv_normal_map():
@@ -1637,6 +1655,19 @@ def test_color_ramp():
         assert len(cr.elements) == 4
 
 
+def test_float_to_integer():
+    with g.tree():
+        fti = g.FloatToInteger()
+        assert fti.rounding_mode == "ROUND"
+        fti.rounding_mode = "FLOOR"
+        assert fti.rounding_mode == "FLOOR"
+
+        fti = g.Float().o.value.to_integer("TRUNCATE")
+        node = fti.builder_node
+        assert isinstance(node, g.FloatToInteger)
+        assert node.rounding_mode == "TRUNCATE"
+
+
 def test_store_named_attribute():
     with g.tree():
         points = g.Points()
@@ -1962,7 +1993,15 @@ def test_grid_socket_methods():
         assert isinstance(fgrid.sdf_mean_curvature(), FloatSocketGrid)
         assert isinstance(fgrid.sdf_median(), FloatSocketGrid)
         assert isinstance(fgrid.sdf_offset(), FloatSocketGrid)
-        assert isinstance(fgrid.to_mesh(), GeometrySocket)
+
+        to_mesh = fgrid.to_mesh(threshold=g.Value(2.0), adaptivity=g.Value(0.0))
+        assert isinstance(to_mesh, GeometrySocket)
+        node = to_mesh.builder_node
+        assert isinstance(node, g.GridToMesh)
+        assert node.i.adaptivity.links
+        assert node.i.threshold.links
+        assert node.i.adaptivity.links[0].from_node.bl_idname == g.Value._bl_idname
+        assert node.i.threshold.links[0].from_node.bl_idname == g.Value._bl_idname
 
         # _VectorGridOperatorMixin (vector grids only)
         assert isinstance(vgrid.curl(), VectorSocketGrid)
